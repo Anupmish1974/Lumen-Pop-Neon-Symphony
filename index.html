@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lumen Pop: Neon Symphony – a hands-only VR game</title>
+<meta name="description" content="Lumen Pop: Neon Symphony. A seated, hands-only WebXR game for Meta Quest. Poke glowing orbs to play music, chase your own ghost in the Daily Challenge, or play by looking and pinching.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#070a1c;overflow:hidden;font-family:"Trebuchet MS",system-ui,sans-serif}
+#info a{color:#ffc857}
+#info details{pointer-events:auto;max-width:640px;margin:8px auto 0;background:#0b1030cc;border-radius:10px;padding:8px 12px;text-align:left;font-size:13px}
+#info{position:fixed;top:12px;left:12px;right:12px;text-align:center;color:#bfeee6;font-size:14px;pointer-events:none;text-shadow:0 1px 6px #000}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<noscript>Lumen Pop needs JavaScript and WebXR (open it in the Meta Quest Browser).</noscript>
+<div id="info"><b>Lumen Pop: Neon Symphony</b>: open in the Meta Quest Browser and tap “Enter VR”. No controllers needed. On desktop, click the orbs (Space = pinch in Look &amp; Pinch mode).
+<details><summary>How to play and what is inside</summary>
+Poke glowing cyan orbs with your index finger: every pop plays the next note of a melody, and your combo adds layers to the music (hi-hats at x5, bass and a light show at x10, an arpeggio at x20). Gold orbs play a chord and are worth more. Dark red orbs break the music and cost points.<br><br>
+Modes: Classic (60 s), Zen (no timer, no hazards), Daily Challenge (same orb sequence for everyone today, and a ghost hand replays your best run of the day so you can race it).<br><br>
+Options: “Large targets” makes orbs bigger and slower. “Look &amp; Pinch” lets you aim with where you look (head gaze) and pinch thumb and index finger to pop, so you can play without reaching. Everything is playable with hands only, seated, within a two-foot radius.</details></div>
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const BG = new THREE.Color(0x070a1c), bgTmp = new THREE.Color(), RED = new THREE.Color(0x3a0614);
+const scene = new THREE.Scene();
+scene.background = BG.clone();
+scene.fog = new THREE.Fog(0x070a1c, 1.5, 7);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 50);
+camera.position.set(0, 1.3, 0);
+scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x101030, 1.3));
+
+// Play space is a group placed in front of the seated player's head.
+const world = new THREE.Group();
+world.position.set(0, 1.3, 0);
+scene.add(world);
+
+// Stars (they change color with the music)
+let stars;
+{
+  const n = 600, a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(3 + Math.random() * 3);
+    a.set([v.x, v.y + 1.3, v.z], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(a, 3));
+  stars = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x9fb8ff, size: 0.02 })); scene.add(stars);
+}
+
+// ---------- Text panels (redrawn only when the text changes) ----------
+function label(w, h, px) {
+  const c = document.createElement('canvas');
+  c.width = px; c.height = Math.round(px * h / w);
+  const x = c.getContext('2d');
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.draw = (lines) => {
+    const key = JSON.stringify(lines);
+    if (key === m.key) return;
+    m.key = key;
+    x.clearRect(0, 0, c.width, c.height);
+    x.textAlign = 'center'; x.textBaseline = 'middle';
+    lines.forEach(([t, size, col], i) => {
+      x.font = `bold ${size}px "Trebuchet MS", sans-serif`;
+      x.fillStyle = col || '#ffffff';
+      x.fillText(t, c.width / 2, (i + 0.5) * c.height / lines.length);
+    });
+    tex.needsUpdate = true;
+  };
+  return m;
+}
+const hud = label(0.56, 0.14, 1024); hud.position.set(0, 0.29, -0.62); world.add(hud);
+const msg = label(0.7, 0.3, 1024); msg.position.set(0, 0.1, -0.72); world.add(msg);
+
+// ---------- Audio: procedural notes, drums and music layers ----------
+let ac = null, master = null, noiseBuf = null;
+function audio() {
+  if (!ac) {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    master = ac.createGain(); master.gain.value = 0.9; master.connect(ac.destination);
+  }
+  if (ac.state === 'suspended') ac.resume();
+  return ac;
+}
+function tone(f, d = 0.14, type = 'sine', vol = 0.12, at) {
+  try {
+    const a = audio(), t = at ?? a.currentTime;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g).connect(master); o.start(t); o.stop(t + d + 0.02);
+  } catch (e) {}
+}
+function kick(t, vol) {
+  try {
+    const a = audio(), o = a.createOscillator(), g = a.createGain();
+    o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(45, t + 0.18);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    o.connect(g).connect(master); o.start(t); o.stop(t + 0.27);
+  } catch (e) {}
+}
+function hat(t, vol) {
+  try {
+    const a = audio();
+    if (!noiseBuf) {
+      noiseBuf = a.createBuffer(1, Math.floor(a.sampleRate * 0.1), a.sampleRate);
+      const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = 7000;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    s.connect(f).connect(g).connect(master); s.start(t); s.stop(t + 0.06);
+  } catch (e) {}
+}
+// Pentatonic melody: each successful pop plays the next note, so a combo becomes a tune.
+const SCALE = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25, 783.99, 880.00, 1046.50, 1174.66];
+const ROOTS = [130.81, 110.00, 87.31, 98.00]; // C, A, F, G progression
+let nextBeat = 0, step = 0;
+const level = () => combo >= 20 ? 3 : combo >= 10 ? 2 : combo >= 5 ? 1 : 0;
+function music() {
+  if (!ac || state !== 'play') return;
+  const zen = mode === 'zen', L = level(), v = zen ? 0.5 : 1;
+  const dur = 60 / (zen ? 72 : 96 + Math.min(combo, 30)) / 2; // eighth notes, tempo rises with combo
+  if (nextBeat < ac.currentTime) nextBeat = ac.currentTime + 0.05;
+  while (nextBeat < ac.currentTime + 0.15) {
+    const t = nextBeat, root = ROOTS[Math.floor(step / 8) % 4];
+    if (step % 8 === 0) tone(root, dur * 7, 'triangle', 0.045 * v, t);           // bass pad, every bar
+    if (!zen && step % 4 === 0) kick(t, 0.10);                                   // pulse
+    if (L >= 1 && step % 2 === 1) hat(t, 0.025 * v);                              // x5: hi-hats
+    if (L >= 2) { if (!zen && step % 4 === 2) kick(t, 0.08); if (step % 2 === 0) tone(root * 2, dur * 0.9, 'triangle', 0.04 * v, t); } // x10: bass line
+    if (L >= 3) tone(root * 4 * [1, 1.5, 2, 3][step % 4], dur * 0.8, 'sine', 0.025 * v, t);  // x20: arpeggio
+    nextBeat += dur; step++;
+  }
+}
+
+// ---------- Game state ----------
+const COL = { cyan: 0x5ef2d6, gold: 0xffc857, void: 0xff3d6e, ui: 0x8aa2ff, access: 0x8aa2ff, look: 0x6fd3ff, 'm-classic': 0x5ef2d6, 'm-zen': 0xb28cff, 'm-daily': 0xffc857, end: 0xb28cff, ghost: 0xd9c2ff };
+const GEO = new THREE.SphereGeometry(1, 28, 20);
+const RING = new THREE.RingGeometry(0.8, 1, 32);
+let state = 'menu', mode = 'classic', big = false, look = false, rnd = Math.random;
+let score = 0, combo = 0, bestCombo = 0, timeLeft = 60, spawnT = 0, elapsed = 0;
+let glow = 0, redFlash = 0, flashText = '', flashT = 0;
+const load = k => { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+let seen = !!load('lumenpop-seen');
+const bestKey = () => 'lumenpop-best-' + mode;
+function seeded(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const todaySeed = () => { const d = new Date(); return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); };
+const orbs = [], fx = [];
+
+// Ghost: the Daily Challenge records every pop of your best run today and replays it as a ghost hand.
+const ghostKey = () => 'lumenpop-ghost-' + todaySeed();
+let ghost = null, ghostI = 0, ghostScore = 0, rec = [];
+const ghostTip = new THREE.Mesh(new THREE.SphereGeometry(0.014, 16, 12),
+  new THREE.MeshBasicMaterial({ color: COL.ghost, transparent: true, opacity: 0.5, depthWrite: false }));
+ghostTip.visible = false; world.add(ghostTip);
+const ghostGoal = new THREE.Vector3(0, -0.15, -0.3);
+
+window.lumen = {
+  get state() { return state; }, get score() { return score; }, get mode() { return mode; },
+  get combo() { return combo; }, get musicLevel() { return level(); },
+  get largeTargets() { return big; }, get lookAndPinch() { return look; },
+  get ghostScore() { return ghost ? ghostScore : null; }
+};
+
+function makeOrb(type, pos, r, life) {
+  const col = COL[type] ?? COL.ui;
+  const mat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.9, transparent: true, opacity: 0.95, roughness: 0.3 });
+  const m = new THREE.Mesh(GEO, mat);
+  m.position.copy(pos); m.scale.setScalar(0.001);
+  m.userData = { type, r, life, age: 0 };
+  if (type === 'void') {
+    const ring = new THREE.Mesh(RING, new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide }));
+    ring.scale.setScalar(1.35); m.add(ring);
+    mat.color.set(0x1a0410);
+  }
+  world.add(m); orbs.push(m); return m;
+}
+const _head = new THREE.Vector3();
+function headPos(v) { (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(v); return v; }
+function burst(pos, col, o = {}) {
+  const m = new THREE.Mesh(RING, new THREE.MeshBasicMaterial({ color: col, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+  m.position.copy(pos); world.add(m); m.lookAt(headPos(_head));
+  m.userData = { age: 0, s0: o.s0 ?? 0.03, s1: o.s1 ?? 0.08, op: o.op ?? 1, life: o.life ?? 0.4 };
+  fx.push(m);
+}
+function removeOrb(o) { world.remove(o); if (o.userData.lbl) world.remove(o.userData.lbl); orbs.splice(orbs.indexOf(o), 1); }
+
+const toggleText = t => t === 'access' ? 'Large targets: ' + (big ? 'ON' : 'OFF') : 'Look & Pinch: ' + (look ? 'ON' : 'OFF');
+function menuItem(type, x, y, text) {
+  const o = makeOrb(type, new THREE.Vector3(x, y, -0.48), 0.045, Infinity);
+  const l = label(0.21, 0.06, 256); l.position.set(x, y - 0.07, -0.48); l.draw([[text, 28, '#ffffff']]);
+  world.add(l); o.userData.lbl = l; return o;
+}
+function showMenu(over) {
+  state = over ? 'over' : 'menu';
+  orbs.slice().forEach(removeOrb);
+  ghostTip.visible = false;
+  if (over) {
+    const b0 = +load(bestKey()) || 0, nb = score > b0, b = nb ? score : b0;
+    if (nb) save(bestKey(), b);
+    let last = ['Best combo x' + bestCombo, 40, '#5ef2d6'];
+    if (mode === 'daily') {
+      if (ghost) last = score > ghost.score ? ['You beat your ghost (' + ghost.score + ')!', 40, '#d9c2ff'] : ['Ghost wins: ' + ghost.score + '. Try again!', 40, '#d9c2ff'];
+      else last = ['Ghost saved. Race it next run!', 40, '#d9c2ff'];
+      if (!ghost || score > ghost.score) save(ghostKey(), { score, ev: rec });
+    }
+    msg.draw([[mode === 'zen' ? 'Session complete' : 'Time’s up', 60, '#bfeee6'], ['Score ' + score, 86, '#ffc857'], [nb ? 'New best!' : 'Best ' + b + ' (' + mode + ')', 42, '#8aa2ff'], last]);
+  } else {
+    msg.draw([['LUMEN POP', 100, '#5ef2d6'], ['Neon Symphony', 50, '#b28cff'], ['Poke an orb with your index finger to begin', 36, '#cfd8ff'], ['Gold = chord bonus     Dark red = breaks the music', 32, '#ffc857']]);
+  }
+  hud.draw([[over ? 'Choose a mode to play again' : 'Choose a mode', 40, '#cfd8ff']]);
+  menuItem('m-classic', -0.2, -0.1, 'Classic 60s');
+  menuItem('m-zen', 0, -0.1, 'Zen, no timer');
+  menuItem('m-daily', 0.2, -0.1, 'Daily Challenge');
+  menuItem('access', -0.11, -0.24, toggleText('access'));
+  menuItem('look', 0.11, -0.24, toggleText('look'));
+}
+function startGame() {
+  anchor();
+  orbs.slice().forEach(removeOrb);
+  rnd = mode === 'daily' ? seeded(todaySeed()) : Math.random;
+  state = 'play'; score = 0; combo = 0; bestCombo = 0; timeLeft = 60; spawnT = 0; elapsed = 0;
+  glow = 0; redFlash = 0; flashT = 0; step = 0; nextBeat = 0;
+  rec = []; ghostI = 0; ghostScore = 0;
+  ghost = mode === 'daily' ? load(ghostKey()) : null;
+  if (ghost && !Array.isArray(ghost.ev)) ghost = null;
+  ghostGoal.set(0, -0.15, -0.3); ghostTip.position.copy(ghostGoal);
+  msg.draw([]);
+  if (mode === 'zen') menuItem('end', 0, -0.25, 'End session');
+}
+function spawn() {
+  const zen = mode === 'zen', k = rnd();
+  const type = (!zen && k < 0.14) ? 'void' : k < 0.26 ? 'gold' : 'cyan';
+  const pos = new THREE.Vector3((rnd() - 0.5) * 0.6, (rnd() - 0.5) * 0.34, -(0.38 + rnd() * 0.17));
+  const r = (type === 'gold' ? 0.032 : 0.042) * (big ? 1.5 : 1);
+  const life = (type === 'gold' ? 1.6 : 2.4) * (big ? 1.3 : 1) * (zen ? 1.4 : 1);
+  makeOrb(type, pos, r, life);
+}
+function hit(o) {
+  if (!orbs.includes(o)) return;
+  const t = o.userData.type, p = o.position.clone(), now = performance.now();
+  if (t.startsWith('m-')) { tone(660, 0.2); mode = t.slice(2); startGame(); return; }
+  if (t === 'access' || t === 'look') {
+    if (now - (o.userData.t || 0) < 900) return;
+    o.userData.t = now;
+    if (t === 'access') big = !big; else look = !look;
+    tone((t === 'access' ? big : look) ? 600 : 400);
+    o.userData.lbl.draw([[toggleText(t), 28, '#ffffff']]); return;
+  }
+  if (t === 'end') { tone(330, 0.3); showMenu(true); return; }
+  if (state !== 'play') return;
+  if (t === 'void') {
+    score = Math.max(0, score - 30); combo = 0; redFlash = 1;
+    tone(110, 0.4, 'sawtooth', 0.12); tone(116.5, 0.4, 'sawtooth', 0.1); // the music "breaks"
+    burst(p, COL.void);
+  } else {
+    combo++; bestCombo = Math.max(bestCombo, combo);
+    score += t === 'gold' ? 50 : 10 + Math.min(combo, 20);
+    if (t === 'gold') { tone(523.25, 0.4, 'triangle', 0.08); tone(659.25, 0.4, 'triangle', 0.07); tone(783.99, 0.4, 'triangle', 0.07); }
+    else { const n = SCALE[(combo - 1) % SCALE.length]; tone(n, 0.24, 'sine', 0.14); tone(n * 2, 0.12, 'triangle', 0.03); }
+    if (combo % 10 === 0) {
+      glow = 1; flashText = 'SYMPHONY x' + combo + '!'; flashT = 1.4;
+      if (ac) tone(1046.5, 0.45, 'triangle', 0.08, ac.currentTime + 0.09);
+      [COL.cyan, COL.gold, 0xb28cff].forEach((c, i) => burst(new THREE.Vector3(0, 0, -0.5), c, { s0: 0.05, s1: 0.45 + i * 0.2, life: 0.9, op: 0.8 }));
+    }
+    burst(p, COL[t]);
+  }
+  if (mode === 'daily') rec.push([+elapsed.toFixed(2), +p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3), score]);
+  removeOrb(o);
+}
+
+// ---------- Hands: index fingertip poke + thumb-index pinch ----------
+const tips = [0, 1].map(i => {
+  const h = renderer.xr.getHand(i); scene.add(h);
+  h.userData.on = false;
+  h.addEventListener('connected', () => h.userData.on = true);
+  h.addEventListener('disconnected', () => h.userData.on = false);
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.011, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  m.visible = false; scene.add(m);
+  return { h, m, p: new THREE.Vector3(), pinched: false };
+});
+function pinch() { if (look && gazeTarget) hit(gazeTarget); }
+function updateHands() {
+  for (const t of tips) {
+    const j = t.h.joints && t.h.joints['index-finger-tip'];
+    const th = t.h.joints && t.h.joints['thumb-tip'];
+    if (t.h.userData.on && j && j.position.lengthSq() > 1e-6) {
+      j.getWorldPosition(t.p); t.m.position.copy(t.p); t.m.visible = true;
+      const local = world.worldToLocal(t.p.clone());
+      for (const o of orbs.slice()) if (o.scale.x > o.userData.r * 0.5 && o.position.distanceTo(local) < o.scale.x + 0.012) hit(o);
+      if (th && th.position.lengthSq() > 1e-6) {
+        const d = j.position.distanceTo(th.position);
+        if (!t.pinched && d < 0.018) { t.pinched = true; pinch(); }
+        else if (t.pinched && d > 0.035) t.pinched = false;
+      }
+    } else { t.m.visible = false; t.pinched = false; }
+  }
+}
+
+// ---------- Look & Pinch: aim with head gaze, pinch to pop ----------
+const reticle = new THREE.Mesh(RING, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthTest: false }));
+reticle.visible = false; reticle.renderOrder = 10; world.add(reticle);
+let gazeTarget = null;
+const _hp = new THREE.Vector3(), _hd = new THREE.Vector3(), _q = new THREE.Quaternion(), _w = new THREE.Vector3();
+function updateGaze() {
+  gazeTarget = null;
+  if (!look) { reticle.visible = false; return; }
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  cam.getWorldPosition(_hp); cam.getWorldDirection(_hd);
+  world.worldToLocal(_hp);
+  world.getWorldQuaternion(_q).invert(); _hd.applyQuaternion(_q);
+  let best = 1;
+  for (const o of orbs) {
+    if (o.scale.x < o.userData.r * 0.5) continue;
+    _w.subVectors(o.position, _hp);
+    const t = _w.dot(_hd); if (t <= 0.05) continue;
+    const perp = Math.sqrt(Math.max(0, _w.lengthSq() - t * t));
+    const s = perp / Math.max(0.06 * t, o.scale.x * 1.5); // about 3.5 degrees, or 1.5x the orb radius
+    if (s < best) { best = s; gazeTarget = o; }
+  }
+  if (gazeTarget) {
+    reticle.visible = true; reticle.position.copy(gazeTarget.position);
+    reticle.scale.setScalar(gazeTarget.scale.x * 1.7); reticle.lookAt(world.localToWorld(_hp.clone()));
+  } else reticle.visible = false;
+}
+
+// ---------- Anchor play space in front of the seated head ----------
+let anchored = false, frames = 0;
+const _v = new THREE.Vector3(), _d = new THREE.Vector3();
+function anchor() {
+  if (!renderer.xr.isPresenting) return;
+  const xc = renderer.xr.getCamera();
+  xc.getWorldPosition(_v); xc.getWorldDirection(_d);
+  world.position.set(_v.x, _v.y - 0.04, _v.z);
+  world.rotation.y = Math.atan2(-_d.x, -_d.z);
+  anchored = true;
+}
+renderer.xr.addEventListener('sessionstart', () => { anchored = false; frames = 0; tone(520, 0.1); showMenu(false); });
+
+// ---------- Desktop fallback: click to pop, Space to pinch ----------
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+addEventListener('pointerdown', e => {
+  try { audio(); } catch (err) {} // unlock audio on the first user gesture (also the Enter VR tap)
+  if (renderer.xr.isPresenting) return;
+  mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+  const h = ray.intersectObjects(orbs, false)[0];
+  if (h) hit(h.object);
+});
+addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); try { audio(); } catch (err) {} pinch(); } });
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+showMenu(false);
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (renderer.xr.isPresenting && !anchored && ++frames > 20) anchor();
+
+  if (state === 'play') {
+    const zen = mode === 'zen';
+    elapsed += dt; if (!zen) timeLeft -= dt;
+    spawnT -= dt; flashT -= dt;
+    if (spawnT <= 0) { spawn(); spawnT = zen ? 1.1 : Math.max(0.42, 0.95 - elapsed * 0.009) * (big ? 1.25 : 1); }
+    if (ghost) {
+      while (ghostI < ghost.ev.length && ghost.ev[ghostI][0] <= elapsed) {
+        const g = ghost.ev[ghostI++]; ghostScore = g[4];
+        burst(new THREE.Vector3(g[1], g[2], g[3]), COL.ghost, { op: 0.45, s1: 0.06 });
+      }
+      const nx = ghost.ev[ghostI];
+      if (nx) ghostGoal.set(nx[1], nx[2], nx[3]);
+      ghostTip.visible = true; ghostTip.position.lerp(ghostGoal, Math.min(1, dt * 8));
+    }
+    music();
+    const lines = [[`Score ${score}     ${zen ? 'Zen' : 'Time ' + Math.ceil(Math.max(timeLeft, 0))}     Combo x${combo}`, 50, '#ffffff']];
+    if (flashT > 0) lines.push([flashText, 44, '#ffc857']);
+    else if (ghost) lines.push([`Ghost ${ghostScore}     ${score >= ghostScore ? 'You are ahead' : 'You are behind'}`, 36, '#d9c2ff']);
+    else if (!seen && elapsed < 7) lines.push([look ? 'Tip: look at an orb, then pinch thumb and index finger' : 'Tip: touch the glowing orbs with your index fingertip', 34, '#5ef2d6']);
+    hud.draw(lines);
+    if (!seen && elapsed > 7) { seen = true; save('lumenpop-seen', 1); }
+    if (!zen && timeLeft <= 0) { tone(330, 0.4); showMenu(true); }
+  }
+  for (const o of orbs.slice()) {
+    const u = o.userData; u.age += dt;
+    o.material.emissiveIntensity = o === gazeTarget ? 1.8 : 0.9;
+    if (u.life === Infinity) { o.scale.setScalar(u.r * (1 + 0.08 * Math.sin(u.age * 4)) * Math.min(1, u.age * 4)); continue; }
+    const grow = Math.min(1, u.age / 0.25), fade = Math.min(1, (u.life - u.age) / 0.4);
+    o.scale.setScalar(u.r * (0.4 + 0.6 * grow) * (0.7 + 0.3 * Math.max(fade, 0)));
+    o.material.opacity = 0.95 * Math.max(fade, 0);
+    if (u.age >= u.life) { if (u.type !== 'void') combo = 0; removeOrb(o); }
+  }
+  for (const f of fx.slice()) {
+    const u = f.userData; u.age += dt; const k = u.age / u.life;
+    f.scale.setScalar(u.s0 + k * u.s1); f.material.opacity = u.op * (1 - k);
+    if (k >= 1) { world.remove(f); fx.splice(fx.indexOf(f), 1); }
+  }
+  // Light show: the sky shifts color with the combo and flashes on every x10 milestone.
+  glow = Math.max(0, glow - dt * 0.8); redFlash = Math.max(0, redFlash - dt * 2.5);
+  const L = state === 'play' ? level() : 0, hue = (performance.now() / 4000) % 1;
+  bgTmp.setHSL(hue, 0.8, 0.22);
+  scene.background.copy(BG).lerp(bgTmp, Math.min(0.6, glow * 0.5 + L * 0.06));
+  if (redFlash > 0) scene.background.lerp(RED, redFlash * 0.6);
+  scene.fog.color.copy(scene.background);
+  stars.material.color.setHSL(L >= 2 ? hue : 0.62, L >= 2 ? 0.8 : 0.6, 0.78);
+  stars.material.size = 0.02 + glow * 0.02;
+  stars.rotation.y += dt * (0.01 + L * 0.015);
+  updateHands();
+  updateGaze();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
